@@ -6,6 +6,7 @@ import asyncio
 import html
 import json
 import logging
+import os
 import random
 import re
 import secrets
@@ -14,7 +15,6 @@ import time
 import traceback
 from datetime import datetime, timedelta
 
-import sqlite3
 from pathlib import Path
 from telegram import (
     CopyTextButton,
@@ -49,10 +49,11 @@ from telegram.ext import (
 # EASY CONFIGURATION — edit these values directly, no .env needed
 # ============================================================
 APP_NAME = "ShownXStore Bot"
-BOT_TOKEN = '8614537982:AAFJaOFf9YNLVp_Cm6Xs5GuCgXr9OsBfWIY'  # From @BotFather
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8614537982:AAHC864l9pOD9YwhgYvtnB6fY7GXU7YeGBQ")  # Set a newly rotated token
 OWNER_USERNAME = "@ShownJones"  # Owner handle (for reference)
 OWNER_ID =  7660357725 # Numeric Telegram user ID
-SQLITE_DB_PATH = "bot.db"  # Local SQLite file beside this script
+MONGODB_URI = os.getenv("MONGODB_URI", "mongodb+srv://learnonix_db_user:HHaKUL7sIDF4Hqhn@cluster0.rw7isyw.mongodb.net/?appName=Cluster0&retryWrites=true&w=majority")  # MongoDB Atlas or self-hosted URI
+MONGODB_DATABASE = os.getenv("MONGODB_DATABASE", "shown_x_store")
 BOT_USERNAME = ""  # Optional; auto-detected on startup
 USER_LOG_CHANNEL_ID = 0  # 0 disables user activity logs
 RICH_MESSAGES_ENABLED = True
@@ -65,7 +66,7 @@ _BOT_INSTANCE = None
 def _validate_config() -> None:
     """Fail early with an actionable message if the top-level settings are unchanged."""
     missing = []
-    if not BOT_TOKEN or "PASTE_YOUR_" in BOT_TOKEN:
+    if not BOT_TOKEN or "PASTE_" in BOT_TOKEN:
         missing.append("BOT_TOKEN")
     if not isinstance(OWNER_ID, int) or OWNER_ID <= 0:
         missing.append("OWNER_ID (must be your numeric Telegram user ID)")
@@ -829,8 +830,8 @@ DEFAULT_SETTINGS = {
     "daily_bonus": "25",
     "premium_daily_bonus_multiplier": "2",
     "premium_daily_bonus": "40",
-    "support_username": "p4ime",
-    "payment_username": "p4ime",
+    "support_username": "ShownJones",
+    "payment_username": "ShownJones",
     "force_join": "1",
     "maintenance": "0",
     "star_rate": "30",
@@ -1250,239 +1251,105 @@ class LocalCursor:
         return iterate()
 
 
-class SQLiteCollection:
+class MongoCursor:
+    """Small cursor adapter preserving the existing bot's async cursor API."""
+    def __init__(self, cursor):
+        self.cursor = cursor
+
+    def sort(self, key_or_list, direction=None):
+        self.cursor = self.cursor.sort(key_or_list, direction) if isinstance(key_or_list, str) else self.cursor.sort(key_or_list)
+        return self
+
+    def skip(self, count):
+        self.cursor = self.cursor.skip(max(0, int(count or 0)))
+        return self
+
+    def limit(self, count):
+        self.cursor = self.cursor.limit(int(count or 0))
+        return self
+
+    async def to_list(self, length=None):
+        return await self.cursor.to_list(length=length)
+
+    def __aiter__(self):
+        return self.cursor.__aiter__()
+
+
+class MongoCollection:
+    """Compatibility wrapper over a real MongoDB collection."""
     def __init__(self, database, name):
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
-            raise ValueError("Invalid SQLite collection name")
+            raise ValueError("Invalid MongoDB collection name")
         self.database = database
         self.name = name
-        self.table = f'"{name}"'
+        self.collection = database.database[name]
 
     def find(self, query=None, projection=None):
-        async def load():
-            async with self.database.lock:
-                self.database._ensure_collection(self.name)
-                rows = self.database.connection.execute(
-                    f"SELECT document FROM {self.table}"
-                ).fetchall()
-                docs = [json.loads(row[0]) for row in rows]
-            return [_apply_projection(d, projection) for d in docs if _matches(d, query or {})]
-        return LocalCursor(load)
+        return MongoCursor(self.collection.find(query or {}, projection))
 
     async def find_one(self, query=None, projection=None, sort=None):
-        cursor = self.find(query, projection)
-        if sort:
-            cursor.sort(sort)
-        rows = await cursor.limit(1).to_list(1)
-        return rows[0] if rows else None
+        return await self.collection.find_one(query or {}, projection, sort=sort)
 
     async def insert_one(self, document):
-        doc = dict(document)
-        async with self.database.lock:
-            self.database._ensure_collection(self.name)
-            if "_id" in doc:
-                for row in self.database.connection.execute(f"SELECT document FROM {self.table}").fetchall():
-                    if json.loads(row[0]).get("_id") == doc["_id"]:
-                        raise ValueError(f"Duplicate _id in {self.name}")
-            encoded = json.dumps(doc, ensure_ascii=False, default=str)
-            cur = self.database.connection.execute(f"INSERT INTO {self.table}(document) VALUES (?)", (encoded,))
-            row_id = cur.lastrowid
-            if "_id" not in doc:
-                doc["_id"] = row_id
-                self.database.connection.execute(
-                    f"UPDATE {self.table} SET document=? WHERE rowid=?",
-                    (json.dumps(doc, ensure_ascii=False, default=str), row_id),
-                )
-            return _WriteResult(inserted_id=doc.get("_id"))
+        return await self.collection.insert_one(dict(document))
 
     async def insert_many(self, documents):
-        ids = []
-        for doc in documents:
-            ids.append((await self.insert_one(doc)).inserted_id)
-        return _WriteResult(inserted_id=ids)
-
-    async def _update_matching(self, query, update, upsert=False, many=False):
-        async with self.database.lock:
-            self.database._ensure_collection(self.name)
-            rows = self.database.connection.execute(
-                f"SELECT rowid, document FROM {self.table}"
-            ).fetchall()
-            matched = []
-            for row_id, raw in rows:
-                doc = json.loads(raw)
-                if _matches(doc, query or {}):
-                    matched.append((row_id, doc))
-                    if not many:
-                        break
-            if not matched and upsert:
-                seed = {}
-                for key, value in (query or {}).items():
-                    if not key.startswith("$") and not (isinstance(value, dict) and any(str(k).startswith("$") for k in value)):
-                        _path_set(seed, key, value)
-                new_doc = _apply_update(seed, update, inserting=True)
-                cur = self.database.connection.execute(
-                    f"INSERT INTO {self.table}(document) VALUES (?)",
-                    (json.dumps(new_doc, ensure_ascii=False, default=str),),
-                )
-                row_id = cur.lastrowid
-                if "_id" not in new_doc:
-                    new_doc["_id"] = row_id
-                self.database.connection.execute(
-                    f"UPDATE {self.table} SET document=? WHERE rowid=?",
-                    (json.dumps(new_doc, ensure_ascii=False, default=str), row_id),
-                )
-                return _WriteResult(0, 0, new_doc.get("_id"))
-            modified = 0
-            for row_id, old_doc in matched:
-                new_doc = _apply_update(old_doc, update)
-                if new_doc != old_doc:
-                    self.database.connection.execute(
-                        f"UPDATE {self.table} SET document=? WHERE rowid=?",
-                        (json.dumps(new_doc, ensure_ascii=False, default=str), row_id),
-                    )
-                    modified += 1
-            return _WriteResult(len(matched), modified)
+        return await self.collection.insert_many([dict(d) for d in documents])
 
     async def update_one(self, query, update, upsert=False):
-        return await self._update_matching(query, update, upsert, False)
+        return await self.collection.update_one(query or {}, update, upsert=upsert)
 
     async def update_many(self, query, update, upsert=False):
-        return await self._update_matching(query, update, upsert, True)
+        return await self.collection.update_many(query or {}, update, upsert=upsert)
 
-    async def find_one_and_update(self, query, update, upsert=False, return_document=ReturnDocument.BEFORE, projection=None, sort=None, **kwargs):
-        async with self.database.lock:
-            self.database._ensure_collection(self.name)
-            rows = self.database.connection.execute(
-                f"SELECT rowid, document FROM {self.table}"
-            ).fetchall()
-            matches = [(rid, json.loads(raw)) for rid, raw in rows if _matches(json.loads(raw), query or {})]
-            if sort:
-                spec = sort if isinstance(sort, list) else [sort]
-                for key, direction in reversed(spec):
-                    matches.sort(key=lambda pair: _path_get(pair[1], key), reverse=int(direction) < 0)
-            if matches:
-                row_id, old_doc = matches[0]
-                new_doc = _apply_update(old_doc, update)
-                self.database.connection.execute(
-                    f"UPDATE {self.table} SET document=? WHERE rowid=?",
-                    (json.dumps(new_doc, ensure_ascii=False, default=str), row_id),
-                )
-                result = new_doc if return_document else old_doc
-                return _apply_projection(result, projection)
-            if not upsert:
-                return None
-            seed = {}
-            for key, value in (query or {}).items():
-                if not key.startswith("$") and not (isinstance(value, dict) and any(str(k).startswith("$") for k in value)):
-                    _path_set(seed, key, value)
-            new_doc = _apply_update(seed, update, inserting=True)
-            cur = self.database.connection.execute(
-                f"INSERT INTO {self.table}(document) VALUES (?)",
-                (json.dumps(new_doc, ensure_ascii=False, default=str),),
-            )
-            row_id = cur.lastrowid
-            if "_id" not in new_doc:
-                new_doc["_id"] = row_id
-            self.database.connection.execute(
-                f"UPDATE {self.table} SET document=? WHERE rowid=?",
-                (json.dumps(new_doc, ensure_ascii=False, default=str), row_id),
-            )
-            return _apply_projection(new_doc, projection) if return_document else None
+    async def find_one_and_update(self, query, update, upsert=False,
+                                  return_document=ReturnDocument.BEFORE,
+                                  projection=None, sort=None, **kwargs):
+        from pymongo import ReturnDocument as MongoReturnDocument
+        rd = MongoReturnDocument.AFTER if bool(return_document) else MongoReturnDocument.BEFORE
+        return await self.collection.find_one_and_update(
+            query or {}, update, upsert=upsert, return_document=rd,
+            projection=projection, sort=sort, **kwargs
+        )
 
     async def delete_many(self, query=None):
-        async with self.database.lock:
-            self.database._ensure_collection(self.name)
-            rows = self.database.connection.execute(
-                f"SELECT rowid, document FROM {self.table}"
-            ).fetchall()
-            ids = [rid for rid, raw in rows if _matches(json.loads(raw), query or {})]
-            self.database.connection.executemany(
-                f"DELETE FROM {self.table} WHERE rowid=?", [(rid,) for rid in ids]
-            )
-            return _WriteResult(len(ids), len(ids))
+        return await self.collection.delete_many(query or {})
 
     async def count_documents(self, query=None):
-        return len(await self.find(query).to_list())
+        return await self.collection.count_documents(query or {})
 
     def aggregate(self, pipeline):
-        async def load():
-            rows = await self.find({}).to_list()
-            for stage in pipeline:
-                if "$match" in stage:
-                    rows = [d for d in rows if _matches(d, stage["$match"])]
-                elif "$sample" in stage:
-                    rows = random.sample(rows, min(len(rows), int(stage["$sample"].get("size", 1))))
-                elif "$group" in stage:
-                    spec = stage["$group"]
-                    groups = {}
-                    for doc in rows:
-                        key_expr = spec.get("_id")
-                        key = _expr_value(key_expr, doc)
-                        bucket = groups.setdefault(key, {"_id": key})
-                        for name, accumulator in spec.items():
-                            if name == "_id" or not isinstance(accumulator, dict):
-                                continue
-                            if "$sum" in accumulator:
-                                value = _expr_value(accumulator["$sum"], doc)
-                                bucket[name] = bucket.get(name, 0) + (value if isinstance(value, (int, float)) else 0)
-                            elif "$max" in accumulator:
-                                value = _expr_value(accumulator["$max"], doc)
-                                previous = bucket.get(name)
-                                bucket[name] = value if previous is None or (value is not None and value > previous) else previous
-                    rows = list(groups.values())
-                elif "$sort" in stage:
-                    for key, direction in reversed(list(stage["$sort"].items())):
-                        rows.sort(key=lambda d: (_path_get(d, key) is None, _path_get(d, key)), reverse=int(direction) < 0)
-                elif "$limit" in stage:
-                    rows = rows[:int(stage["$limit"])]
-                elif "$count" in stage:
-                    rows = [{stage["$count"]: len(rows)}] if rows else []
-            return rows
-        return LocalCursor(load)
+        return MongoCursor(self.collection.aggregate(pipeline))
 
     async def create_index(self, spec, unique=False, **kwargs):
-        """Create a JSON-expression index where possible; unique conflicts are surfaced to caller."""
-        fields = [spec] if isinstance(spec, str) else [item[0] for item in spec]
-        safe = re.sub(r"[^A-Za-z0-9_]", "_", self.name + "_" + "_".join(fields))
-        expressions = ", ".join("json_extract(document, '$." + f.replace("'", "") + "')" for f in fields)
-        kind = "UNIQUE " if unique else ""
-        async with self.database.lock:
-            self.database._ensure_collection(self.name)
-            self.database.connection.execute(
-                f"CREATE {kind}INDEX IF NOT EXISTS idx_{safe} ON {self.table}({expressions})"
-            )
+        if isinstance(spec, str):
+            spec = [(spec, 1)]
+        return await self.collection.create_index(spec, unique=unique, **kwargs)
 
     async def bulk_write(self, operations, ordered=True):
-        for operation in operations:
-            await self.update_one(operation.filter, operation.update, upsert=operation.upsert)
-        return _WriteResult()
+        from pymongo import UpdateOne as MongoUpdateOne
+        ops = [MongoUpdateOne(op.filter, op.update, upsert=op.upsert) for op in operations]
+        if not ops:
+            return _WriteResult()
+        return await self.collection.bulk_write(ops, ordered=ordered)
 
 
-class SQLiteDatabase:
-    def __init__(self, path):
-        raw_path = Path(path)
-        self.path = raw_path if raw_path.is_absolute() else Path(__file__).resolve().parent / raw_path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.connection = None
-        self.lock = asyncio.Lock()
+class MongoDatabase:
+    def __init__(self, uri, database_name):
+        if not uri:
+            raise RuntimeError("Set MONGODB_URI to your MongoDB connection string.")
+        if not database_name:
+            raise RuntimeError("Set MONGODB_DATABASE to your MongoDB database name.")
+        self.uri = uri
+        self.database_name = database_name
+        self.client = None
+        self.database = None
 
     async def open(self):
-        async with self.lock:
-            if self.connection is None:
-                self.connection = sqlite3.connect(str(self.path), check_same_thread=False, isolation_level=None)
-                self.connection.execute("PRAGMA journal_mode=WAL")
-                self.connection.execute("PRAGMA synchronous=NORMAL")
-                self.connection.execute("PRAGMA busy_timeout=30000")
-                self.connection.commit()
-
-    def _ensure_collection(self, name):
-        if self.connection is None:
-            raise RuntimeError("SQLite database is not open")
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
-            raise ValueError("Invalid SQLite collection name")
-        self.connection.execute(
-            f'CREATE TABLE IF NOT EXISTS "{name}" (document TEXT NOT NULL)'
-        )
+        from motor.motor_asyncio import AsyncIOMotorClient
+        self.client = AsyncIOMotorClient(self.uri, serverSelectionTimeoutMS=10000)
+        self.database = self.client[self.database_name]
+        await self.client.admin.command("ping")
 
     def __getattr__(self, name):
         if name.startswith("_"):
@@ -1490,421 +1357,13 @@ class SQLiteDatabase:
         return self[name]
 
     def __getitem__(self, name):
-        return SQLiteCollection(self, name)
+        return MongoCollection(self, name)
 
     async def close(self):
-        async with self.lock:
-            if self.connection is not None:
-                self.connection.commit()
-                self.connection.close()
-                self.connection = None
-
-
-class SQLiteCursor:
-    def __init__(self, rows):
-        self.rows = rows
-        self.index = 0
-
-    async def fetchone(self):
-        if self.index >= len(self.rows):
-            return None
-        row = self.rows[self.index]
-        self.index += 1
-        return row
-
-    async def fetchall(self):
-        rows = self.rows[self.index:]
-        self.index = len(self.rows)
-        return rows
-
-
-
-def _value(token, params, pos):
-    token = token.strip()
-    if token == "?":
-        return params[pos[0]]
-    if token.startswith("'") and token.endswith("'"):
-        return token[1:-1].replace("''", "'")
-    try:
-        return int(token)
-    except ValueError:
-        return token
-
-
-def _conditions(where, params):
-    if not where:
-        return {}
-    pos = [0]
-    clauses = re.split(r"\s+AND\s+", where, flags=re.I)
-    parts = []
-    for clause in clauses:
-        clause = clause.strip().strip("()")
-        # Support the OR expression used by premium statistics as well as
-        # the original AND-only queries.  The previous adapter treated the
-        # whole "a=1 OR b>?" text as one value, returning incorrect totals.
-        alternatives = re.split(r"\s+OR\s+", clause, flags=re.I)
-        alternative_docs = []
-        for alternative in alternatives:
-            alternative = alternative.strip().strip("()")
-            in_match = re.match(r"([\w.]+)\s+IN\s*\((.*?)\)", alternative, re.I)
-            if in_match:
-                field = in_match.group(1).split(".")[-1]
-                values = []
-                for token in in_match.group(2).split(","):
-                    values.append(_value(token, params, pos))
-                    if token.strip() == "?":
-                        pos[0] += 1
-                alternative_docs.append({field: {"$in": values}})
-                continue
-            m = re.match(r"([\w.]+)\s+IS\s+(NOT\s+)?NULL", alternative, re.I)
-            if m:
-                alternative_docs.append({
-                    m.group(1).split(".")[-1]: {"$ne": None} if m.group(2) else None
-                })
-                continue
-            # SQLite queries in this file use both ``field=?`` and
-            # ``field = ?`` forms.  Requiring spaces here silently discarded
-            # every WHERE clause in the SQLite compatibility layer, so buttons
-            # repeatedly returned the first document in a collection.
-            m = re.match(r"([\w.]+)\s*(LIKE|!=|<>|>=|<=|=|>|<)\s*(.+)", alternative, re.I)
-            if not m:
-                continue
-            field, op, raw = m.groups()
-            field = field.split(".")[-1]
-            val = _value(raw, params, pos)
-            if raw.strip() == "?":
-                pos[0] += 1
-            if op.upper() == "LIKE":
-                alternative_docs.append({
-                    field: {"$regex": re.escape(str(val)).replace("%", ".*"), "$options": "i"}
-                })
-            else:
-                alternative_docs.append({
-                    field: {"=": val, "!=": {"$ne": val}, "<>": {"$ne": val},
-                            ">": {"$gt": val}, "<": {"$lt": val},
-                            ">=": {"$gte": val}, "<=": {"$lte": val}}[op]
-                })
-        if len(alternative_docs) == 1:
-            parts.append(alternative_docs[0])
-        elif alternative_docs:
-            parts.append({"$or": alternative_docs})
-    if len(parts) == 1:
-        return parts[0]
-    return {"$and": parts} if parts else {}
-
-
-
-class SQLiteCompatConnection:
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *args):
-        return None
-
-    async def commit(self):
-        return None
-
-    async def executescript(self, script):
-        return None
-
-    async def execute(self, sql, params=()):
-        sql = " ".join(str(sql).split())
-        params = tuple(params or ())
-        command = sql.split()[0].upper()
-        if command == "ALTER":
-            return SQLiteCursor([])
-        if command == "SELECT":
-            return await self._select(sql, params)
-        if command == "INSERT":
-            return await self._insert(sql, params)
-        if command == "UPDATE":
-            return await self._update(sql, params)
-        if command == "DELETE":
-            return await self._delete(sql, params)
-        return SQLiteCursor([])
-
-    async def _select(self, sql, params):
-        if re.search(r"last_insert_rowid", sql, re.I):
-            return SQLiteCursor([SQLiteRow({"last_insert_rowid()": getattr(self, "last_id", 0)})])
-        m = re.match(
-            r"SELECT (.+?) FROM (\w+)"
-            r"(?:\s+(?!WHERE\b|ORDER\b|LIMIT\b|OFFSET\b|JOIN\b|GROUP\b)(\w+))?(.*)",
-            sql, re.I,
-        )
-        if not m:
-            return SQLiteCursor([])
-        fields, table, _alias, tail = m.groups()
-        coll = _sqlite_db[table]
-        where_m = re.search(r"\bWHERE\b (.*?)(?=\s+ORDER BY|\s+LIMIT|\s+OFFSET|$)", tail, re.I)
-        where = _conditions(where_m.group(1), params) if where_m else {}
-        # COUNT queries do not need to materialise every document.  This is
-        # especially important for the admin statistics screen.
-        if ("COUNT(" in fields.upper() and not re.search(r"\bJOIN\b|\bGROUP BY\b", tail, re.I)):
-            count = await coll.count_documents(where)
-            return SQLiteCursor([SQLiteRow({fields: count})])
-        # Handle the one join used by purchase history.
-        join = re.search(r"JOIN\s+(\w+)\s+(\w+)\s+ON\s+([\w.]+)\s*=\s*([\w.]+)", tail, re.I)
-        group_m = re.search(r"GROUP BY\s+([\w.]+)", tail, re.I)
-        order = re.search(r"ORDER BY\s+([\w.]+)(?:\s+(ASC|DESC))?", tail, re.I)
-        offset_m = re.search(r"OFFSET\s+(\?|\d+)", tail, re.I)
-        limit_m = re.search(r"LIMIT\s+(\?|\d+)", tail, re.I)
-        is_random = "ORDER BY RANDOM()" in tail.upper()
-        # Fast path: plain SELECT (no JOIN/GROUP BY) can push sort, skip and
-        # limit down to SQLite instead of pulling every matching document
-        # into Python first. This is the hot path for paginated screens
-        # (file lists, purchase history, top files) and avoids transferring
-        # the whole collection on every button press.
-        #
-        # ORDER BY RANDOM() gets its own fast path using SQLite's native
-        # $sample aggregation stage, which picks random documents on the
-        # server side instead of loading the entire collection into Python
-        # and shuffling it there (the old behaviour did a full collection
-        # scan + transfer for something like "pick 1 random file").
-        if not join and not group_m and is_random:
-            lim_val = 1
-            if limit_m:
-                lim_val = int(_value(
-                    limit_m.group(1), params,
-                    [max(0, len(params) - 1)],
-                ))
-            pipeline = []
-            if where:
-                pipeline.append({"$match": where})
-            pipeline.append({"$sample": {"size": max(1, lim_val)}})
-            docs = await coll.aggregate(pipeline).to_list(length=None)
-            selected = []
-            field_parts = [x.strip() for x in fields.split(",")]
-            includes_all = fields.strip() == "*" or any(
-                re.fullmatch(r"\w+\.\*", part) for part in field_parts
-            )
-            names = [
-                part.split()[-1].split(".")[-1]
-                for part in field_parts
-                if not re.fullmatch(r"(?:\w+\.)?\*", part)
-            ]
-            for d in docs:
-                row = {k: v for k, v in d.items() if k != "_id"} if includes_all else {}
-                for name in names:
-                    row[name] = d.get(name)
-                selected.append(SQLiteRow(row))
-            return SQLiteCursor(selected)
-        if not join and not group_m and not is_random:
-            cursor = coll.find(where)
-            if order:
-                key, direction = order.groups()
-                key = key.split(".")[-1]
-                cursor = cursor.sort(key, -1 if (direction or "").upper() == "DESC" else 1)
-            off_val = None
-            if offset_m:
-                off_val = int(_value(offset_m.group(1), params, [len(params) - 1]))
-                cursor = cursor.skip(off_val)
-            if limit_m:
-                lim_val = int(_value(
-                    limit_m.group(1), params,
-                    [max(0, len(params) - 2 if offset_m else len(params) - 1)],
-                ))
-                cursor = cursor.limit(lim_val)
-            docs = await cursor.to_list(length=None)
-            if "SUM(" in fields.upper():
-                field = re.search(r"SUM\((?:\w+\.)?(\w+)\)", fields, re.I).group(1)
-                val = sum((d.get(field) or 0) for d in docs)
-                return SQLiteCursor([SQLiteRow({fields: val})])
-            selected = []
-            field_parts = [x.strip() for x in fields.split(",")]
-            includes_all = fields.strip() == "*" or any(
-                re.fullmatch(r"\w+\.\*", part) for part in field_parts
-            )
-            names = [
-                part.split()[-1].split(".")[-1]
-                for part in field_parts
-                if not re.fullmatch(r"(?:\w+\.)?\*", part)
-            ]
-            for d in docs:
-                row = {k: v for k, v in d.items() if k != "_id"} if includes_all else {}
-                for name in names:
-                    row[name] = d.get(name)
-                selected.append(SQLiteRow(row))
-            return SQLiteCursor(selected)
-        # GROUP BY (no JOIN) gets its own fast path using SQLite's native
-        # aggregation pipeline ($group + $sort + $limit run on the server).
-        # The old behaviour pulled the entire collection into Python just to
-        # count-and-group it locally — expensive for a frequently-clicked
-        # screen like the referral leaderboard as the collection grows.
-        if not join and group_m:
-            group_field = group_m.group(1).split(".")[-1]
-            count_alias = re.search(r"COUNT\(\*\)\s+AS\s+(\w+)", fields, re.I)
-            alias = count_alias.group(1) if count_alias else "COUNT(*)"
-            pipeline = []
-            if where:
-                pipeline.append({"$match": where})
-            pipeline.append({"$group": {"_id": f"${group_field}", "_count": {"$sum": 1}}})
-            if order:
-                key, direction = order.groups()
-                key = key.split(".")[-1]
-                sort_key = "_count" if key.lower() in (alias.lower(), "cnt") else "_id"
-                pipeline.append({"$sort": {sort_key: -1 if (direction or "").upper() == "DESC" else 1}})
-            if limit_m:
-                lim_val = int(_value(
-                    limit_m.group(1), params,
-                    [max(0, len(params) - 1)],
-                ))
-                pipeline.append({"$limit": lim_val})
-            docs = await coll.aggregate(pipeline).to_list(length=None)
-            return SQLiteCursor([
-                SQLiteRow({group_field: d["_id"], alias: d["_count"]})
-                for d in docs
-            ])
-        docs = await coll.find(where).to_list(length=None)
-        if join:
-            other, alias, left, right = join.groups()
-            other_docs = await _sqlite_db[other].find({}).to_list(length=None)
-            lk, rk = left.split(".")[-1], right.split(".")[-1]
-            docs = [SQLiteRow({**a, **{f"{k}": v for k, v in b.items() if k not in a}})
-                    for a in docs for b in other_docs if a.get(lk) == b.get(rk)]
-        if group_m:
-            group_field = group_m.group(1).split(".")[-1]
-            count_alias = re.search(r"COUNT\(\*\)\s+AS\s+(\w+)", fields, re.I)
-            alias = count_alias.group(1) if count_alias else "COUNT(*)"
-            grouped = {}
-            for doc in docs:
-                grouped.setdefault(doc.get(group_field), 0)
-                grouped[doc.get(group_field)] += 1
-            return SQLiteCursor([
-                SQLiteRow({group_field: value, alias: count})
-                for value, count in grouped.items()
-            ])
-        if "COUNT(" in fields.upper() or "SUM(" in fields.upper():
-            if "COUNT" in fields.upper():
-                val = len(docs)
-            else:
-                field = re.search(r"SUM\((?:\w+\.)?(\w+)\)", fields, re.I).group(1)
-                val = sum((d.get(field) or 0) for d in docs)
-            return SQLiteCursor([SQLiteRow({fields: val})])
-        if is_random:
-            random.shuffle(docs)
-        if order:
-            key, direction = order.groups()
-            key = key.split(".")[-1]
-            if key.upper() != "RANDOM":
-                docs.sort(key=lambda d: d.get(key) or 0, reverse=(direction or "").upper() == "DESC")
-        # LIMIT precedes OFFSET in all existing queries; consume the final params.
-        if offset_m:
-            off = _value(offset_m.group(1), params, [len(params)-1])
-            docs = docs[int(off):]
-        if limit_m:
-            limit = _value(limit_m.group(1), params, [max(0, len(params)-2 if offset_m else len(params)-1)])
-            docs = docs[:int(limit)]
-        selected = []
-        field_parts = [x.strip() for x in fields.split(",")]
-        includes_all = fields.strip() == "*" or any(
-            re.fullmatch(r"\w+\.\*", part) for part in field_parts
-        )
-        names = [
-            part.split()[-1].split(".")[-1]
-            for part in field_parts
-            if not re.fullmatch(r"(?:\w+\.)?\*", part)
-        ]
-        for d in docs:
-            row = {k: v for k, v in d.items() if k != "_id"} if includes_all else {}
-            for name in names:
-                row[name] = d.get(name)
-            selected.append(SQLiteRow(row))
-        return SQLiteCursor(selected)
-
-    async def _insert(self, sql, params):
-        m = re.search(r"INTO\s+(\w+)\s*\((.*?)\)\s*VALUES\s*\((.*?)\)", sql, re.I)
-        if not m:
-            return SQLiteCursor([])
-        table, columns, values = m.groups()
-        vals, pos = [], [0]
-        for token in values.split(","):
-            vals.append(_value(token, params, pos))
-            if token.strip() == "?": pos[0] += 1
-        doc = dict(zip([c.strip() for c in columns.split(",")], vals))
-        if table == "files":
-            # SQLite supplied these defaults through the schema. SQLite is
-            # schemaless, so missing defaults would hide new files from the
-            # ``WHERE is_deleted=0`` Buy Files query.
-            doc.setdefault("is_deleted", 0)
-            doc.setdefault("downloads_count", 0)
-            doc.setdefault("featured", 0)
-            doc.setdefault("mystery_tier", None)
-        elif table == "redeems":
-            # These columns had SQLite defaults before the SQLite adapter was
-            # introduced. Older/newly-created codes may omit them otherwise,
-            # making the redeem handler compare None with the usage limit.
-            doc.setdefault("used_count", 0)
-            doc.setdefault("expiry_date", None)
-            doc.setdefault("status", "active")
-            doc.setdefault("source", "admin")
-        id_fields = {"files":"file_pk","transactions":"tx_id","payments":"payment_id",
-                     "redeem_uses":"id","referrals":"id","force_channels":"id",
-                     "downloads":"id","purchases":"id","admin_logs":"log_id",
-                     "file_requests":"request_id"}
-        pk = id_fields.get(table)
-        if pk and pk not in doc:
-            doc[pk] = await _next_seq(table, pk)
-        conflict = re.search(r"ON CONFLICT\((\w+)\).*?DO UPDATE SET (.*)", sql, re.I)
-        if conflict:
-            key = conflict.group(1)
-            await _sqlite_db[table].update_one({key: doc.get(key)}, {"$set": doc}, upsert=True)
-        elif "OR IGNORE" in sql.upper() or re.search(r"ON CONFLICT\(\w+\)\s+DO NOTHING", sql, re.I):
-            key = re.search(r"ON CONFLICT\((\w+)\)", sql, re.I)
-            if key:
-                key = key.group(1)
-            else:
-                key = next((k for k in ("user_id", "code", "key") if k in doc), "_id")
-            await _sqlite_db[table].update_one({key: doc.get(key)},
-                                               {"$setOnInsert": doc}, upsert=True)
-        else:
-            await _sqlite_db[table].insert_one(doc)
-        self.last_id = doc.get(pk, 0) if pk else 0
-        return SQLiteCursor([])
-
-    async def _update(self, sql, params):
-        m = re.match(r"UPDATE\s+(\w+)\s+SET\s+(.*?)\s+WHERE\s+(.*)", sql, re.I)
-        if not m: return SQLiteCursor([])
-        table, assignments, where = m.groups()
-        pos = [0]; updates = {}
-        for item in assignments.split(","):
-            field, expr = item.split("=", 1); field = field.strip()
-            expr = expr.strip()
-            inc = re.match(rf"{re.escape(field)}\s*([+-])\s*(\?|\d+)", expr, re.I)
-            if inc:
-                val = _value(inc.group(2), params, pos)
-                if inc.group(2) == "?": pos[0] += 1
-                updates[field] = {"$inc": val if inc.group(1) == "+" else -val}
-            else:
-                updates[field] = _value(expr, params, pos)
-                if expr == "?": pos[0] += 1
-        # SET placeholders come before WHERE placeholders in UPDATE queries.
-        # Keep the parameter positions aligned with the original SQL call.
-        filt = _conditions(where, params[pos[0]:])
-        for field, value in updates.items():
-            if isinstance(value, dict) and "$inc" in value:
-                await _sqlite_db[table].update_many(filt, {"$inc": {field: value["$inc"]}})
-            else:
-                await _sqlite_db[table].update_many(filt, {"$set": {field: value}})
-        return SQLiteCursor([])
-
-    async def _delete(self, sql, params):
-        m = re.match(r"DELETE FROM\s+(\w+)(?:\s+WHERE\s+(.*))?", sql, re.I)
-        if m: await _sqlite_db[m.group(1)].delete_many(_conditions(m.group(2), params))
-        return SQLiteCursor([])
-
-
-
-def db_conn():
-    return SQLiteCompatConnection()
-
-
-async def init_db_pool() -> None:
-    return None
-
-
-async def close_db_pool() -> None:
-    if _sqlite_db:
-        await _sqlite_db.close()
+        if self.client is not None:
+            self.client.close()
+            self.client = None
+            self.database = None
 
 
 _NUMERIC_SETTING_KEYS = {
@@ -2003,7 +1462,7 @@ async def _repair_file_ids() -> None:
 
 async def init_db() -> None:
     global _sqlite_db
-    _sqlite_db = SQLiteDatabase(SQLITE_DB_PATH)
+    _sqlite_db = MongoDatabase(MONGODB_URI, MONGODB_DATABASE)
     await _sqlite_db.open()
     # Index the JSON document keys used by common lookups and unique business records.
     indexes = {
@@ -2025,7 +1484,7 @@ async def init_db() -> None:
             try:
                 await _sqlite_db[collection].create_index(field)
             except Exception:
-                log.warning("Could not create SQLite index %s.%s", collection, field)
+                log.warning("Could not create MongoDB index %s.%s", collection, field)
     for collection, spec in (
         ("files", [("is_deleted", 1), ("file_pk", -1)]),
         ("payments", [("status", 1), ("payment_id", -1)]),
@@ -2034,7 +1493,7 @@ async def init_db() -> None:
         try:
             await _sqlite_db[collection].create_index(spec)
         except Exception:
-            log.warning("Could not create SQLite compound index on %s", collection)
+            log.warning("Could not create MongoDB compound index on %s", collection)
     for collection, spec in (
         ("users", [("user_id", 1)]),
         ("wallet", [("user_id", 1)]),
@@ -2047,7 +1506,7 @@ async def init_db() -> None:
         try:
             await _sqlite_db[collection].create_index(spec, unique=True)
         except Exception:
-            log.warning("Could not create SQLite unique index on %s", collection)
+            log.warning("Could not create MongoDB unique index on %s", collection)
     await _repair_file_ids()
     for k, v in DEFAULT_SETTINGS.items():
         await _sqlite_db.settings.update_one({"key": k}, {"$setOnInsert": {"key": k, "value": v}}, upsert=True)
@@ -2070,7 +1529,7 @@ async def init_db() -> None:
             {"$setOnInsert": {"user_id": OWNER_ID, "added_date": datetime.utcnow().isoformat(), "role": "owner"}},
             upsert=True,
         )
-    log.info("SQLite database ready: %s", _sqlite_db.path)
+    log.info("MongoDB database ready: %s", MONGODB_DATABASE)
 
 
 
@@ -2148,7 +1607,7 @@ async def get_setting_json(key: str, default):
 
 
 async def set_setting(key: str, value: str) -> None:
-    # Use a real SQLite upsert here.  The SQL compatibility layer is useful
+    # Use a direct MongoDB upsert here.  The SQL compatibility layer is useful
     # for the older handlers, but it made this frequently used path slower
     # and could leave duplicate settings in imported databases.
     await _sqlite_db.settings.update_one(
@@ -3347,7 +2806,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def handle_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await guard_user(update, context):
         return
-    support_username = (await get_setting("support_username", "p4ime")).lstrip("@")
+    support_username = (await get_setting("support_username", "ShownJones")).lstrip("@")
     text = ui_screen(
         "💬", "Support",
         ui_box(
@@ -3357,7 +2816,7 @@ async def handle_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         footer="We usually reply within a few hours.",
     )
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💬 Message Support", url=f"https://t.me/p4ime", style="success")],
+        [InlineKeyboardButton("💬 Message Support", url=f"https://t.me/ShownJones", style="success")],
     ])
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
@@ -3671,7 +3130,7 @@ async def cb_wallet_tx(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def _buycoins_screen():
     packages = await get_setting_json("coin_packages", DEFAULT_COIN_PACKAGES)
-    payment_username = (await get_setting("payment_username", "p4ime")).lstrip("@")
+    payment_username = (await get_setting("payment_username", "ShownJones")).lstrip("@")
     text = ui_screen(
         "⭐", "Bᴜʏ Cᴏɪɴꜱ — Mᴀɴᴜᴀʟ Sᴛᴀʀꜱ Pᴀʏᴍᴇɴᴛ",
         ui_box(*[f"{COIN_E} <b>{p['coins']}</b> Cᴏɪɴꜱ  =  {STAR_E} <b>{p['stars']}</b> Sᴛᴀʀꜱ" for p in packages]),
@@ -3881,7 +3340,7 @@ async def _gem_packages() -> list[dict]:
 
 async def _buygems_screen_text() -> str:
     packages = await _gem_packages()
-    payment_username = (await get_setting("payment_username", "P4ime")).lstrip("@")
+    payment_username = (await get_setting("payment_username", "ShownJones")).lstrip("@")
     return ui_screen(
         STAR_E, "Bᴜʏ Gᴇᴍꜱ — Mᴀɴᴜᴀʟ Sᴛᴀʀ Pᴀʏᴍᴇɴᴛ",
         ui_box(*[f"{STAR_E} <b>{p['stars']}</b> Sᴛᴀʀꜱ  =  {GEM_E} <b>{p['gems']}</b> Gᴇᴍꜱ" for p in packages]),
@@ -4831,7 +4290,7 @@ async def conv_gift_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     (code, amount, user.id, datetime.utcnow().isoformat()),
                 )
                 await db.commit()
-                # The SQLite compatibility layer is intentionally lightweight;
+                # The database compatibility layer is intentionally lightweight;
                 # verify the write instead of assuming execute() implies that
                 # the document was persisted.
                 cur = await db.execute(
