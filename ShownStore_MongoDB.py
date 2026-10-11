@@ -51,8 +51,8 @@ load_dotenv()
 # ============================================================
 APP_NAME = "ShownXStore Bot"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")  # Set in hosting environment
-OWNER_USERNAME = "@ShownJones"  # Owner handle (for reference)
-OWNER_ID =  7660357725 # Numeric Telegram user ID
+OWNER_USERNAME = "@WhoIsShown"  # Owner handle (for reference)
+OWNER_ID =  8984851474 # Numeric Telegram user ID
 MONGODB_URI = os.getenv("MONGODB_URI", "")  # MongoDB Atlas connection string
 MONGODB_DATABASE = os.getenv("MONGODB_DATABASE", "shown_x_store")
 BOT_USERNAME = ""  # Optional; auto-detected on startup
@@ -3116,7 +3116,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         + "\n\n"
         + f"<blockquote>{WELCOME_LINE}\n"
-        f"{WELCOME_LOVE} <b>Dᴇᴠʟᴏᴩᴇʀ :</b> @P7imeNobita {WELCOME_HEART}\n"
+        f"{WELCOME_LOVE} <b>Dᴇᴠʟᴏᴩᴇʀ :</b> @WhoIsShown {WELCOME_HEART}\n"
         f"{WELCOME_LINE}</blockquote>"
     )
     kb = user_reply_keyboard(admin)
@@ -3227,7 +3227,7 @@ async def handle_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         footer="We usually reply within a few hours.",
     )
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💬 Message Support", url=f"https://t.me/ShownJones", style="success")],
+        [InlineKeyboardButton("💬 Message Support", url=f"https://t.me/WhoIsShown", style="success")],
     ])
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
