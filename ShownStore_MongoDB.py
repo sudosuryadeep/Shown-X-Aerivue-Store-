@@ -14,7 +14,7 @@ import string
 import time
 import traceback
 from datetime import datetime, timedelta
-
+from dotenv import load_dotenv  
 from pathlib import Path
 from telegram import (
     CopyTextButton,
@@ -44,6 +44,7 @@ from telegram.ext import (
     filters,
 )
 
+load_dotenv()
 
 # ============================================================
 # EASY CONFIGURATION — edit these values directly, no .env needed
